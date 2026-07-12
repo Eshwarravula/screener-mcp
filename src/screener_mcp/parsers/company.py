@@ -115,41 +115,60 @@ def parse_overview(html: str) -> dict[str, Any]:
             elif "nseindia" in href or "nseindia" in href.lower():
                 nse = text
 
-    # About text
-    about_tag = soup.find(id="about")
+    # About text — Screener moved this from id="about" to class="about"
+    about_tag = soup.find(id="about") or soup.find(class_="about")
     about = ""
     if about_tag:
         p = about_tag.find("p")
         about = _clean(p.get_text()) if p else ""
 
-    # Sector / industry tags — skip index memberships (BSE Sensex, Nifty*, etc.)
-    sector_tags = soup.select("a.tag")
-    INDEX_PREFIXES = ("bse ", "nifty", "sensex", "dollex", "shariah")
-    sectors = [
-        _clean(t.get_text()) for t in sector_tags
-        if not any(_clean(t.get_text()).lower().startswith(p) for p in INDEX_PREFIXES)
-    ]
+    # Sector / industry — no longer rendered as a.tag pills on the company
+    # page (those are now only index memberships like "BSE Sensex", "Nifty
+    # 50"). The real classification lives in the peers-section breadcrumb as
+    # <a title="Broad Sector|Sector|Broad Industry|Industry">.
+    sectors = []
+    peers_section = soup.find(id="peers")
+    if peers_section:
+        breadcrumb = peers_section.find("p", class_="sub")
+        if breadcrumb:
+            sectors = [_clean(a.get_text()) for a in breadcrumb.find_all("a")]
+    if not sectors:
+        sector_tags = soup.select("a.tag")
+        INDEX_PREFIXES = ("bse ", "nifty", "sensex", "dollex", "shariah")
+        sectors = [
+            _clean(t.get_text()) for t in sector_tags
+            if not any(_clean(t.get_text()).lower().startswith(p) for p in INDEX_PREFIXES)
+        ]
 
-    # Top ratios
+    # Top ratios — "High / Low" now arrives as a single li with two
+    # span.number children instead of separate "52 Week High"/"52 Week Low"
+    # entries, so it needs splitting out before the generic key/value loop.
     ratios = {}
     top_ratios = soup.find(id="top-ratios")
     if top_ratios:
         for li in top_ratios.find_all("li"):
             name_span = li.find("span", class_="name")
-            val_span = li.find("span", class_="number")
-            if not val_span:
-                val_span = li.find("span", class_=lambda c: c and "value" in str(c).lower())
-            if name_span:
-                key = _clean(name_span.get_text())
-                val = _clean(val_span.get_text()) if val_span else ""
-                ratios[key] = val
+            if not name_span:
+                continue
+            key = _clean(name_span.get_text())
+            number_spans = li.select("span.value span.number")
+            if key == "High / Low" and len(number_spans) >= 2:
+                ratios["52 Week High"] = _clean(number_spans[0].get_text())
+                ratios["52 Week Low"] = _clean(number_spans[1].get_text())
+                continue
+            val_span = number_spans[0] if number_spans else li.find(
+                "span", class_=lambda c: c and "value" in str(c).lower()
+            )
+            ratios[key] = _clean(val_span.get_text()) if val_span else ""
 
-    # Current price
-    price_tag = soup.find(id="company-nav")
-    price = ""
-    if price_tag:
-        p_span = price_tag.find("span", class_="number")
-        price = _clean(p_span.get_text()) if p_span else ""
+    # Current price — "Current Price" now lives inside top-ratios;
+    # #company-nav is just the tab navigation and no longer carries price.
+    price = ratios.get("Current Price", "")
+    if not price:
+        price_tag = soup.find(id="company-nav") or soup.find(class_="company-nav")
+        if price_tag:
+            p_span = price_tag.find("span", class_="number")
+            price = _clean(p_span.get_text()) if p_span else ""
 
     # 52-week high/low (sometimes in top ratios, sometimes separate)
     high_52, low_52 = ratios.pop("52 Week High", ""), ratios.pop("52 Week Low", "")

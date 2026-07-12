@@ -32,8 +32,10 @@ def parse_search_results(json_data: list) -> list[dict]:
 
 
 def _extract_id(url: str) -> str:
-    """Extract symbol from URL like /company/TCS/"""
+    """Extract symbol from URL like /company/TCS/consolidated/"""
     parts = [p for p in url.strip("/").split("/") if p]
+    if len(parts) >= 2 and parts[0] == "company":
+        return parts[1]
     if parts:
         return parts[-1]
     return url
@@ -46,7 +48,11 @@ def parse_screen_results(html: str) -> dict:
     """
     soup = BeautifulSoup(html, "lxml")
 
-    result_count_tag = soup.find(class_="count-text") or soup.find(id="count")
+    result_count_tag = (
+        soup.find(attrs={"data-page-info": True})
+        or soup.find(class_="count-text")
+        or soup.find(id="count")
+    )
     result_count = _clean(result_count_tag.get_text()) if result_count_tag else "unknown"
 
     table = soup.find("table", id="data-table")
@@ -56,7 +62,14 @@ def parse_screen_results(html: str) -> dict:
     if not table:
         return {"count": result_count, "companies": [], "columns": []}
 
-    headers = [_clean(th.get_text()) for th in table.select("thead th")]
+    # Screener's screen-results table has no <thead> — the header row is the
+    # first <tr> in <tbody>, using <th> cells instead of <td>.
+    header_cells = table.select("thead th")
+    if not header_cells:
+        first_row = table.find("tr")
+        header_cells = first_row.find_all("th") if first_row else []
+
+    headers = [_clean(th.get_text()) for th in header_cells]
 
     companies = []
     for tr in table.select("tbody tr"):
