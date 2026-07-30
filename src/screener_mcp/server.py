@@ -2,19 +2,27 @@
 Screener.in MCP Server — Indian Stock Research Assistant
 
 Tools exposed to Claude:
-  search_company          — find a company by name or symbol
-  get_company_overview    — key ratios, about, price data
-  get_financials          — P&L / Balance Sheet / Cash Flow / Ratios history
-  get_quarterly_results   — last 8 quarters of results
-  get_shareholding        — promoter / FII / DII / public holding trend
-  get_peers               — peer comparison table
-  compare_companies       — side-by-side comparison of 2-5 companies
-  screen_stocks           — custom Screener.in query
-  screen_by_theme         — pre-built thematic screens
-  list_themes             — list available theme screens
-  get_full_analysis       — ALL data for deep-dive reasoning
-  get_red_flags           — structured red flag checklist data
-  beginner_explainer      — data + prompt for beginner-friendly explanation
+  search_company              — find a company by name or symbol
+  get_company_overview        — key ratios, about, price data
+  get_financials              — P&L / Balance Sheet / Cash Flow / Ratios history
+  get_quarterly_results       — last 8 quarters of results
+  get_shareholding            — promoter / FII / DII / public holding trend
+  get_peers                   — peer comparison table
+  compare_companies           — side-by-side comparison of 2-5 companies
+  screen_stocks               — custom Screener.in query
+  screen_by_theme             — pre-built thematic screens
+  list_themes                 — list available theme screens
+  get_full_analysis           — ALL data for deep-dive reasoning
+  get_red_flags               — structured red flag checklist data
+  beginner_explainer          — data + prompt for beginner-friendly explanation
+  compare_stocks_ui           — interactive comparison dashboard (Claude Desktop)
+  get_document_list           — list annual reports and earnings call transcripts
+  analyze_annual_report       — ask questions over annual report PDFs (RAG)
+  analyze_earnings_call       — ask questions over earnings call transcripts (RAG)
+  get_company_announcements   — fetch recent NSE corporate announcements
+  search_shareholder          — find bulk deal activity by investor name
+  get_commodity_prices        — commodity price context and company impact analysis
+  notebook_ai                 — save and summarize investment research notes
 
 Resources:
   screener://analyst-guide    — how to use this assistant
@@ -26,12 +34,18 @@ Setup:
     SCREENER_PASSWORD=yourpassword
   Without credentials, public data only (some metrics may be hidden).
 
+  For document analysis (analyze_annual_report, analyze_earnings_call):
+    pip install pdfplumber sentence-transformers chromadb
+
 Run:
   python -m screener_mcp.server
   or via Claude Code MCP config (see README).
 """
 
 import httpx
+import json
+import re
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from .tools.company_tools import (
     search_company as _search_company,
@@ -52,6 +66,15 @@ from .tools.analysis_tools import (
     get_red_flags as _red_flags,
     beginner_explainer as _beginner,
 )
+from .tools.documents import (
+    get_document_list as _get_document_list,
+    analyze_annual_report as _analyze_annual_report,
+    analyze_earnings_call as _analyze_earnings_call,
+)
+from .tools.announcements import get_company_announcements as _get_announcements
+from .tools.shareholders import search_shareholder as _search_shareholder
+from .tools.commodities import get_commodity_prices as _get_commodity_prices
+from .tools.notebook import notebook_ai as _notebook_ai
 
 def _safe(result):
     """Wrap a coroutine so network/auth errors become readable messages."""
@@ -343,6 +366,293 @@ async def explain_for_beginners(symbol: str) -> str:
     return await _safe(_beginner)(symbol)
 
 
+def _find_ratio(ratios: dict[str, str], *needles: str) -> str:
+    """Find a key_ratios value by fuzzy substring match (Screener's exact labels vary)."""
+    for needle in needles:
+        for key, value in ratios.items():
+            if needle.lower() in key.lower():
+                return value
+    return ""
+
+
+def _num(text: str) -> float | None:
+    """Parse a Screener-formatted number like '₹ 1,23,456 Cr.' or '23.4%' into a float."""
+    if not text:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", text)
+    try:
+        return float(cleaned) if cleaned not in ("", "-", ".") else None
+    except ValueError:
+        return None
+
+
+def _compute_red_flags(ratios: dict[str, str]) -> list[dict[str, str]]:
+    """Deterministic, rule-based red flag checks computed from a single snapshot of ratios.
+
+    Not a substitute for the LLM-driven analyze_red_flags tool (which reasons over
+    full history) — this only checks point-in-time thresholds so the dashboard has
+    something real to render without an extra model round-trip.
+    """
+    flags: list[dict[str, str]] = []
+
+    debt_equity = _num(_find_ratio(ratios, "Debt to equity"))
+    if debt_equity is not None:
+        if debt_equity > 1.5:
+            flags.append({"flag": f"High debt-to-equity ratio ({debt_equity:.2f})", "severity": "critical"})
+        elif debt_equity > 0.8:
+            flags.append({"flag": f"Elevated debt-to-equity ratio ({debt_equity:.2f})", "severity": "warning"})
+
+    roce = _num(_find_ratio(ratios, "Return on capital employed", "ROCE"))
+    if roce is not None and roce < 10:
+        flags.append({"flag": f"Low return on capital employed ({roce:.1f}%)", "severity": "warning"})
+
+    roe = _num(_find_ratio(ratios, "Return on equity", "ROE"))
+    if roe is not None and roe < 10:
+        flags.append({"flag": f"Low return on equity ({roe:.1f}%)", "severity": "warning"})
+
+    pe = _num(_find_ratio(ratios, "Stock P/E", "P/E"))
+    if pe is not None and pe > 60:
+        flags.append({"flag": f"Very high valuation — P/E of {pe:.1f}", "severity": "info"})
+
+    return flags
+
+
+@mcp.tool()
+async def compare_stocks_ui(symbols: str) -> dict:
+    """
+    Interactive stock comparison dashboard.
+
+    Compare multiple stocks side-by-side with real-time price, market cap,
+    P/E, ROE, ROCE, debt levels, and rule-based red flag checks.
+    Renders as an interactive dashboard in Claude Desktop.
+
+    Args:
+        symbols: Comma-separated stock symbols (e.g., "TCS,INFOSYS,WIPRO")
+
+    Examples:
+      compare_stocks_ui("TCS,INFY,WIPRO")
+      compare_stocks_ui("HDFCBANK,ICICIBANK,AXISBANK")
+      compare_stocks_ui("HUL,ITC,NESTLEIND")
+
+    Note: use NSE trading symbols, not company names (e.g. "INFY" not "INFOSYS").
+    """
+    import asyncio
+    from .client import get_client
+    from .parsers.company import parse_overview
+
+    stock_list = [s.strip().upper() for s in symbols.split(",")][:6]
+    client = await get_client()
+
+    async def fetch(sym: str):
+        html = await client.get_html(f"/company/{sym}/consolidated/")
+        return parse_overview(html)
+
+    results = await asyncio.gather(*[fetch(s) for s in stock_list], return_exceptions=True)
+
+    stocks = []
+    for sym, result in zip(stock_list, results):
+        if isinstance(result, Exception):
+            stocks.append({"symbol": sym, "error": "Symbol not found — use the NSE trading symbol (e.g. INFY, not INFOSYS)."})
+            continue
+
+        ratios = result.get("key_ratios", {})
+        stocks.append({
+            "symbol": sym,
+            "name": result.get("name"),
+            "price": result.get("current_price"),
+            "market_cap": _find_ratio(ratios, "Market Cap"),
+            "pe_ratio": _find_ratio(ratios, "Stock P/E", "P/E"),
+            "roe": _find_ratio(ratios, "Return on equity", "ROE"),
+            "roce": _find_ratio(ratios, "Return on capital employed", "ROCE"),
+            "debt_to_equity": _find_ratio(ratios, "Debt to equity"),
+            "dividend_yield": _find_ratio(ratios, "Dividend Yield"),
+            "book_value": _find_ratio(ratios, "Book Value"),
+            "red_flags": _compute_red_flags(ratios),
+        })
+
+    return {
+        "stocks": stocks,
+        "count": len([s for s in stocks if "error" not in s]),
+    }
+
+
+# ─── Document Analysis ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_document_list(symbol: str) -> str:
+    """
+    List all available annual reports and earnings call transcripts for a company.
+
+    Fetches from Screener.in company page and NSE API.
+
+    symbol: NSE/BSE symbol (e.g., "TCS", "INFY")
+
+    Use this before calling analyze_annual_report or analyze_earnings_call
+    to see what documents are available and their years/quarters.
+    """
+    return await _safe(_get_document_list)(symbol)
+
+
+@mcp.tool()
+async def analyze_annual_report(
+    symbol: str,
+    year: int,
+    question: str = "",
+    pdf_url: str = "",
+) -> str:
+    """
+    Ask any question about a company's annual report using AI-powered semantic search.
+
+    Downloads the PDF, indexes it into a local vector database (ChromaDB),
+    and retrieves the most relevant sections to answer your question.
+    Results are cached — subsequent calls on the same report are instant.
+
+    symbol: NSE/BSE symbol (e.g., "TCS")
+    year: report year (e.g., 2024, 2023)
+    question: what you want to know (leave blank for a general summary)
+    pdf_url: optional — provide directly if you have the link
+
+    Requires: pip install pdfplumber sentence-transformers chromadb
+
+    Examples:
+      analyze_annual_report("TCS", 2024, "What are the key risks mentioned?")
+      analyze_annual_report("INFY", 2023, "What did management say about margins?")
+      analyze_annual_report("RELIANCE", 2024, "Summarize the new energy segment")
+    """
+    return await _safe(_analyze_annual_report)(symbol, year, question, pdf_url or None)
+
+
+@mcp.tool()
+async def analyze_earnings_call(
+    symbol: str,
+    quarter: str,
+    question: str = "",
+    pdf_url: str = "",
+) -> str:
+    """
+    Ask any question about an earnings call transcript using semantic search.
+
+    Same RAG pipeline as analyze_annual_report — downloads, indexes, and retrieves
+    relevant sections from the transcript PDF.
+
+    symbol: NSE/BSE symbol
+    quarter: e.g., "Q1FY25", "Q2FY26", "Q3FY25"
+    question: what you want to know (leave blank for a management commentary summary)
+    pdf_url: optional — provide directly if you have the link
+
+    Requires: pip install pdfplumber sentence-transformers chromadb
+
+    Examples:
+      analyze_earnings_call("HDFCBANK", "Q3FY25", "What is the guidance on NIM?")
+      analyze_earnings_call("TCS", "Q2FY25", "What did they say about deal wins?")
+    """
+    return await _safe(_analyze_earnings_call)(symbol, quarter, question, pdf_url or None)
+
+
+# ─── Corporate Actions & Events ────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_company_announcements(
+    symbol: str,
+    category: str = "all",
+    days: int = 30,
+) -> str:
+    """
+    Fetch recent company announcements from NSE.
+
+    symbol: NSE trading symbol (e.g., "TCS", "RELIANCE")
+    category: filter by type — "all" | "results" | "board_meeting" | "dividend"
+              | "insider_trading" | "agm" | "acquisition" | "buyback" | "fund_raise"
+    days: how many days to look back (default 30, max 365)
+
+    Examples:
+      get_company_announcements("INFY", "results", 90)
+      get_company_announcements("HDFCBANK", "dividend")
+      get_company_announcements("RELIANCE", "all", 7)
+    """
+    return await _safe(_get_announcements)(symbol, category, days)
+
+
+@mcp.tool()
+async def search_shareholder(
+    name: str,
+    symbol: str = "",
+    days: int = 365,
+) -> str:
+    """
+    Search NSE bulk/block deals to find activity by a specific investor or entity.
+
+    Useful for tracking: FIIs, mutual funds, promoters, known investors.
+
+    name: partial or full name (e.g., "Jhunjhunwala", "SBI Mutual Fund", "HDFC AMC")
+    symbol: optional — restrict search to one company's deals
+    days: how many days of history to search (default 365)
+
+    Note: Only captures NSE bulk deals (single trade > 0.5% of equity).
+    For aggregate FII/DII/Promoter holdings, use get_shareholding_pattern().
+
+    Examples:
+      search_shareholder("Jhunjhunwala")
+      search_shareholder("SBI Mutual Fund", symbol="TCS")
+      search_shareholder("Nalanda Capital", days=730)
+    """
+    return await _safe(_search_shareholder)(name, symbol or None, days)
+
+
+# ─── Commodity Analysis ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_commodity_prices(commodity: str, years: int = 5) -> str:
+    """
+    Get commodity price context and its impact on Indian listed companies.
+
+    Covers which companies benefit or suffer from price moves, and suggested
+    Screener queries to find companies exposed to this commodity.
+
+    commodity: gold | silver | crude_oil | copper | aluminium | zinc | nickel
+               | cotton | natural_gas | steel
+    years: historical context period (1–10, default 5)
+
+    Examples:
+      get_commodity_prices("crude_oil")
+      get_commodity_prices("copper", years=3)
+      get_commodity_prices("gold")
+    """
+    return await _safe(_get_commodity_prices)(commodity, years)
+
+
+# ─── Research Notebook ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def notebook_ai(
+    action: str,
+    symbol: str = "",
+    content: str = "",
+    note_id: str = "",
+) -> str:
+    """
+    Save, read, and AI-summarize your investment research notes locally.
+
+    Notes are stored in ~/.screener-mcp/notebooks/ — persists across sessions.
+
+    action:
+      "create"    — new note (requires symbol + content)
+      "append"    — add to existing note (requires note_id + content)
+      "read"      — read a note (requires note_id)
+      "list"      — list all notes (optional symbol filter)
+      "summarize" — AI-structured summary of all notes for a symbol
+      "delete"    — delete a note (requires note_id)
+
+    Examples:
+      notebook_ai("create", symbol="TCS", content="Q3 results strong — revenue beat...")
+      notebook_ai("append", note_id="a1b2c3d4", content="Met management — bullish on BFSI...")
+      notebook_ai("list", symbol="TCS")
+      notebook_ai("summarize", symbol="TCS")
+      notebook_ai("read", note_id="a1b2c3d4")
+    """
+    return await _safe(_notebook_ai)(action, symbol or None, content or None, note_id or None)
+
+
 # ─── Resources ────────────────────────────────────────────────────────────────
 
 @mcp.resource("screener://analyst-guide")
@@ -448,6 +758,31 @@ Profit growth last year > 30 AND Profit growth 3Years > 20 AND Debt to equity < 
 # Momentum + Quality
 Profit growth 5Years > 20 AND Sales growth 5Years > 20 AND Return on capital employed > 20
 """
+
+
+# ─── MCP App UI Resource ──────────────────────────────────────────────────────
+
+# Load the stock comparison dashboard UI bundle
+_ui_bundle_path = Path(__file__).parent.parent.parent / "apps" / "stock-comparison-dashboard" / "dist" / "index.html"
+_ui_bundle = ""
+if _ui_bundle_path.exists():
+    _ui_bundle = _ui_bundle_path.read_text()
+else:
+    _ui_bundle = """
+    <html>
+        <head><title>Stock Comparison Dashboard</title></head>
+        <body style="padding: 20px; font-family: system-ui; color: #666;">
+            <p>⚠️ <strong>Stock comparison UI not found.</strong></p>
+            <p>Build it with: <code>cd apps/stock-comparison-dashboard && npm run build</code></p>
+        </body>
+    </html>
+    """
+
+
+@mcp.resource("screener://stock-comparison")
+def stock_comparison_ui() -> str:
+    """Stock Comparison Dashboard — interactive UI for comparing multiple stocks."""
+    return _ui_bundle
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

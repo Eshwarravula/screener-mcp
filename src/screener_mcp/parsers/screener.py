@@ -32,10 +32,12 @@ def parse_search_results(json_data: list) -> list[dict]:
 
 
 def _extract_id(url: str) -> str:
-    """Extract symbol from URL like /company/TCS/consolidated/"""
+    """Extract symbol from URL like /company/TCS/ or /company/TCS/consolidated/"""
     parts = [p for p in url.strip("/").split("/") if p]
-    if len(parts) >= 2 and parts[0] == "company":
-        return parts[1]
+    if "company" in parts:
+        idx = parts.index("company")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
     if parts:
         return parts[-1]
     return url
@@ -48,31 +50,40 @@ def parse_screen_results(html: str) -> dict:
     """
     soup = BeautifulSoup(html, "lxml")
 
-    result_count_tag = (
-        soup.find(attrs={"data-page-info": True})
-        or soup.find(class_="count-text")
-        or soup.find(id="count")
-    )
-    result_count = _clean(result_count_tag.get_text()) if result_count_tag else "unknown"
+    # Count is in <div class="sub">850 results found: ...</div>
+    result_count = "unknown"
+    for div in soup.find_all("div", class_="sub"):
+        text = _clean(div.get_text())
+        if "result" in text.lower():
+            result_count = text
+            break
 
-    table = soup.find("table", id="data-table")
+    table = soup.find("table", class_="data-table")
+    if not table:
+        table = soup.find("table", id="data-table")
     if not table:
         table = soup.find("table", class_=lambda c: c and "data" in str(c))
 
     if not table:
         return {"count": result_count, "companies": [], "columns": []}
 
-    # Screener's screen-results table has no <thead> — the header row is the
-    # first <tr> in <tbody>, using <th> cells instead of <td>.
-    header_cells = table.select("thead th")
-    if not header_cells:
-        first_row = table.find("tr")
-        header_cells = first_row.find_all("th") if first_row else []
+    # Headers are in the first <tr> using <th> tags (no <thead>)
+    all_rows = table.find_all("tr")
+    if not all_rows:
+        return {"count": result_count, "companies": [], "columns": []}
 
-    headers = [_clean(th.get_text()) for th in header_cells]
+    header_row = all_rows[0]
+    headers = []
+    for th in header_row.find_all("th"):
+        a_tag = th.find("a")
+        label = th.get("data-tooltip") or (a_tag.get_text(strip=True) if a_tag else _clean(th.get_text()))
+        headers.append(_clean(label))
 
+    # Data rows have data-row-company-id attribute
     companies = []
-    for tr in table.select("tbody tr"):
+    for tr in all_rows[1:]:
+        if not tr.get("data-row-company-id"):
+            continue
         cells = tr.find_all("td")
         if not cells:
             continue
@@ -80,7 +91,6 @@ def parse_screen_results(html: str) -> dict:
         for i, h in enumerate(headers):
             cell = cells[i] if i < len(cells) else None
             if cell:
-                # Extract link for name column
                 a_tag = cell.find("a")
                 if a_tag:
                     row[h] = _clean(a_tag.get_text())

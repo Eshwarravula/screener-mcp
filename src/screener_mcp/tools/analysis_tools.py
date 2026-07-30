@@ -224,12 +224,24 @@ def _fmt_shareholding(data: dict) -> str:
 
 def _fmt_peers(peers: list) -> str:
     if not peers:
-        return "## Peers\nNo peer data available."
+        return "## Peers\nNo peer data available (peer table loads via AJAX on Screener.in)."
+
+    # Check if we only have sector breadcrumb context (no actual peer rows)
+    if peers and peers[0].get("_note"):
+        lines = ["## Peer Comparison", "", peers[0]["_note"], ""]
+        sector_rows = [p for p in peers[1:] if "Sector Level" in p]
+        for r in sector_rows:
+            lines.append(f"  {r['Sector Level']}: {r['Name']}")
+        lines.append(
+            "\nTo compare peers, use `compare_companies([\"SYMBOL1\", \"SYMBOL2\", ...])`."
+        )
+        return "\n".join(lines)
+
     columns = list(peers[0].keys()) if peers else []
-    # Remove internal URL key
+    # Remove internal URL / note keys
     columns = [c for c in columns if not c.startswith("_")]
     if not columns:
-        return "## Peers\nNo peer data available."
+        return "## Peers\nNo peer data available (peer table loads via AJAX on Screener.in)."
 
     col_widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in peers)) for c in columns}
     col_widths = {c: min(w, 20) for c, w in col_widths.items()}

@@ -103,7 +103,7 @@ def parse_overview(html: str) -> dict[str, Any]:
         name_tag = soup.find("h1")
     name = _clean(name_tag.get_text()) if name_tag else "Unknown"
 
-    # BSE / NSE codes
+    # BSE / NSE codes — strip "BSE: " / "NSE: " prefixes from link text
     codes_tag = soup.find("div", class_="company-links")
     bse, nse = "", ""
     if codes_tag:
@@ -111,39 +111,29 @@ def parse_overview(html: str) -> dict[str, Any]:
             href = a.get("href", "")
             text = _clean(a.get_text())
             if "bseindia" in href:
-                bse = text
-            elif "nseindia" in href or "nseindia" in href.lower():
-                nse = text
+                bse = re.sub(r"(?i)^BSE\s*:\s*", "", text).strip()
+            elif "nseindia" in href:
+                nse = re.sub(r"(?i)^NSE\s*:\s*", "", text).strip()
 
-    # About text — Screener moved this from id="about" to class="about"
-    about_tag = soup.find(id="about") or soup.find(class_="about")
+    # About text
+    about_tag = soup.find(id="about")
     about = ""
     if about_tag:
         p = about_tag.find("p")
         about = _clean(p.get_text()) if p else ""
 
-    # Sector / industry — no longer rendered as a.tag pills on the company
-    # page (those are now only index memberships like "BSE Sensex", "Nifty
-    # 50"). The real classification lives in the peers-section breadcrumb as
-    # <a title="Broad Sector|Sector|Broad Industry|Industry">.
+    # Sector / industry from market breadcrumb links (Screener renders these in
+    # the peer-comparison section as <a href="/market/…" title="Sector|Industry">)
     sectors = []
-    peers_section = soup.find(id="peers")
-    if peers_section:
-        breadcrumb = peers_section.find("p", class_="sub")
-        if breadcrumb:
-            sectors = [_clean(a.get_text()) for a in breadcrumb.find_all("a")]
-    if not sectors:
-        sector_tags = soup.select("a.tag")
-        INDEX_PREFIXES = ("bse ", "nifty", "sensex", "dollex", "shariah")
-        sectors = [
-            _clean(t.get_text()) for t in sector_tags
-            if not any(_clean(t.get_text()).lower().startswith(p) for p in INDEX_PREFIXES)
-        ]
+    for a in soup.select('a[href*="/market/"]'):
+        if a.get("title", "") in {"Sector", "Industry"}:
+            text = _clean(a.get_text())
+            if text and text not in sectors:
+                sectors.append(text)
 
-    # Top ratios — "High / Low" now arrives as a single li with two
-    # span.number children instead of separate "52 Week High"/"52 Week Low"
-    # entries, so it needs splitting out before the generic key/value loop.
-    ratios = {}
+    # Top ratios — special-case "High / Low" which has two separate number spans
+    ratios: dict[str, str] = {}
+    high_52, low_52 = "", ""
     top_ratios = soup.find(id="top-ratios")
     if top_ratios:
         for li in top_ratios.find_all("li"):
@@ -151,27 +141,21 @@ def parse_overview(html: str) -> dict[str, Any]:
             if not name_span:
                 continue
             key = _clean(name_span.get_text())
-            number_spans = li.select("span.value span.number")
-            if key == "High / Low" and len(number_spans) >= 2:
-                ratios["52 Week High"] = _clean(number_spans[0].get_text())
-                ratios["52 Week Low"] = _clean(number_spans[1].get_text())
-                continue
-            val_span = number_spans[0] if number_spans else li.find(
-                "span", class_=lambda c: c and "value" in str(c).lower()
-            )
-            ratios[key] = _clean(val_span.get_text()) if val_span else ""
+            if key == "High / Low":
+                numbers = li.find_all("span", class_="number")
+                if len(numbers) >= 2:
+                    high_52 = _clean(numbers[0].get_text())
+                    low_52 = _clean(numbers[1].get_text())
+                elif numbers:
+                    high_52 = _clean(numbers[0].get_text())
+            else:
+                val_span = li.find("span", class_="number")
+                if not val_span:
+                    val_span = li.find("span", class_=lambda c: c and "value" in str(c).lower())
+                ratios[key] = _clean(val_span.get_text()) if val_span else ""
 
-    # Current price — "Current Price" now lives inside top-ratios;
-    # #company-nav is just the tab navigation and no longer carries price.
-    price = ratios.get("Current Price", "")
-    if not price:
-        price_tag = soup.find(id="company-nav") or soup.find(class_="company-nav")
-        if price_tag:
-            p_span = price_tag.find("span", class_="number")
-            price = _clean(p_span.get_text()) if p_span else ""
-
-    # 52-week high/low (sometimes in top ratios, sometimes separate)
-    high_52, low_52 = ratios.pop("52 Week High", ""), ratios.pop("52 Week Low", "")
+    # Current price is rendered inside top-ratios, not a separate element
+    price = ratios.pop("Current Price", "")
 
     return {
         "name": name,
@@ -241,13 +225,35 @@ def parse_shareholding(html: str) -> dict[str, Any]:
 
 
 def parse_peers(html: str) -> list[dict[str, str]]:
-    """Parse the peer comparison table."""
+    """
+    Parse the peer comparison table.
+
+    Screener.in loads the peer table via AJAX after page load, so the initial
+    HTML contains only the sector breadcrumb context, not the actual rows.
+    We return whatever is available so the tool can surface useful context.
+    """
     soup = BeautifulSoup(html, "lxml")
     section = soup.find(id="peers")
     if not section:
         return []
+
     table = section.find("table")
-    return _table_to_list(table)
+    if table:
+        return _table_to_list(table)
+
+    # Table not present (AJAX-loaded) — extract sector breadcrumb as context
+    breadcrumb = []
+    for a in section.select('a[href*="/market/"]'):
+        title = a.get("title", "")
+        text = _clean(a.get_text())
+        if title and text:
+            breadcrumb.append({"label": title, "value": text})
+
+    if breadcrumb:
+        return [{"_note": "Peer table loads via AJAX. Sector context below:"}] + [
+            {"Sector Level": b["label"], "Name": b["value"]} for b in breadcrumb
+        ]
+    return []
 
 
 def parse_full_page(html: str) -> dict[str, Any]:

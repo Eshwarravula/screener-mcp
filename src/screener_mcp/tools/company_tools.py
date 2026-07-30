@@ -200,12 +200,24 @@ async def get_peers(symbol: str, financial_type: FinancialType = "consolidated")
     peers = parse_peers(html)
 
     if not peers:
-        return f"No peer data found for {symbol.upper()}."
+        return (
+            f"No peer data found for {symbol.upper()}. "
+            "Screener.in loads the peer table via AJAX — it is not present in the initial HTML. "
+            "Use `compare_companies([\"SYMBOL1\", \"SYMBOL2\"])` to compare specific companies side-by-side."
+        )
 
-    if not peers:
-        return "No peers found."
+    # Check if we only got sector breadcrumb context (no actual peer rows)
+    if peers[0].get("_note"):
+        lines = [f"## {symbol.upper()} — Peer Comparison", "", peers[0]["_note"], ""]
+        sector_rows = [p for p in peers[1:] if "Sector Level" in p]
+        for r in sector_rows:
+            lines.append(f"  {r['Sector Level']}: {r['Name']}")
+        lines.append(
+            "\nTo compare peers manually, use `compare_companies([\"SYMBOL1\", \"SYMBOL2\", ...])`."
+        )
+        return "\n".join(lines)
 
-    columns = list(peers[0].keys()) if peers else []
+    columns = [c for c in peers[0].keys() if not c.startswith("_")]
     col_widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in peers)) for c in columns}
 
     header = "  ".join(f"{c:{col_widths[c]}}" for c in columns)
@@ -239,13 +251,21 @@ async def compare_companies(symbols: list[str], financial_type: FinancialType = 
     results = await asyncio.gather(*[fetch(s) for s in symbols], return_exceptions=True)
 
     companies = []
-    for r in results:
+    failed = []
+    for sym, r in zip([s.upper() for s in symbols], results):
         if isinstance(r, Exception):
-            continue
-        companies.append(r)
+            failed.append(sym)
+        else:
+            companies.append(r)
 
     if not companies:
-        return "Could not fetch data for any of the requested companies."
+        return "Could not fetch data for any of the requested companies. Check that the symbols are valid NSE/BSE codes."
+
+    warnings = []
+    if failed:
+        warnings.append(
+            f"⚠️  Could not fetch data for: {', '.join(failed)} — check these are valid NSE symbols."
+        )
 
     # Build comparison table
     metrics_order = [
@@ -287,5 +307,8 @@ async def compare_companies(symbols: list[str], financial_type: FinancialType = 
     for sym, data in companies:
         sectors = ", ".join(data.get("sectors", []))
         lines.append(f"- {sym}: {sectors or '—'}")
+
+    if warnings:
+        lines += ["", *warnings]
 
     return "\n".join(lines)

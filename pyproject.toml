@@ -29,6 +29,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+ai = [
+    "pdfplumber>=0.11.0",
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/LogeshR15/screener-mcp"
